@@ -15,13 +15,20 @@ A global Pi extension that replaces Pi's TUI footer with a compact Claude-Code-s
 
 ## Global placement
 
-This extension is intended to live under Pi's global extension directory:
+This extension lives in its own git repo under the global Pi git path:
 
 ```text
-~/.pi/agent/extensions/pi-ccui-statusline/
+~/.pi/agent/git/github.com/zk541040600/pi_ccui/pi-ccui-statusline/
 ```
 
-Enable it from `~/.pi/agent/settings.json`:
+A symlink from the extensions directory keeps Pi loading it:
+
+```text
+~/.pi/agent/extensions/pi-ccui-statusline
+  → ~/.pi/agent/git/github.com/zk541040600/pi_ccui/pi-ccui-statusline
+```
+
+Enable it from `~/.pi/agent/settings.json` (already set up):
 
 ```json
 "extensions": [
@@ -33,10 +40,8 @@ Then restart Pi or run `/reload` in an existing Pi TUI session.
 
 ## Development
 
-Install dependencies and run TypeScript checking:
-
 ```bash
-cd ~/.pi/agent/extensions/pi-ccui-statusline
+cd ~/.pi/agent/git/github.com/zk541040600/pi_ccui/pi-ccui-statusline
 corepack pnpm install
 ./node_modules/.bin/tsc --noEmit
 ```
