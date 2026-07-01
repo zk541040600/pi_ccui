@@ -92,6 +92,19 @@ function sessionHasTask(root: string, key: string): boolean {
   }
 }
 
+function countOtherSessionsWithTask(root: string, currentKey: string | null): number {
+  try {
+    const dir = join(root, ".trellis", ".runtime", "sessions");
+    return readdirSync(dir)
+      .filter((file) => file.endsWith(".json"))
+      .map((file) => file.slice(0, -5))
+      .filter((candidate) => candidate !== currentKey && sessionHasTask(root, candidate))
+      .length;
+  } catch {
+    return 0;
+  }
+}
+
 function adoptTrellisSessionKey(root: string, key: string | null): string | null {
   if (key && sessionHasTask(root, key)) return key;
 
@@ -131,8 +144,40 @@ function trellisTaskStatusText(ctx: ExtensionContext, event?: unknown): string {
   const root = findTrellisRoot(ctx.cwd);
   if (!root) return "Trellis: no project";
 
-  const key = adoptTrellisSessionKey(root, contextKey(event, ctx));
-  const taskDir = readTaskDir(root, key);
+  const currentKey = contextKey(event, ctx);
+
+  if (currentKey) {
+    // We have an identified session — show its task or diagnostic
+    if (sessionHasTask(root, currentKey)) {
+      const taskDir = readTaskDir(root, currentKey);
+      if (taskDir) {
+        const fallback = basename(taskDir) || "task";
+        try {
+          const data = JSON.parse(readText(join(taskDir, "task.json"))) as JsonObject;
+          const id = str(data.id) ?? fallback;
+          const status = str(data.status);
+          const text = `Trellis: ${id}${status ? ` (${status})` : ""}`;
+          return text.length > 80 ? `${text.slice(0, 79)}…` : text;
+        } catch {
+          return `Trellis: ${fallback}`;
+        }
+      }
+    }
+    // Current key exists but has no task — diagnostic, do not adopt another session
+    const otherCount = countOtherSessionsWithTask(root, currentKey);
+    if (otherCount > 0) {
+      return `Trellis: no task (${otherCount} other session${otherCount > 1 ? "s" : ""})`;
+    }
+    return "Trellis: no task";
+  }
+
+  // No current key — use single-session fallback only when exactly one task session exists.
+  const otherCount = countOtherSessionsWithTask(root, null);
+  if (otherCount !== 1) {
+    return otherCount > 0 ? `Trellis: no task (${otherCount} other sessions)` : "Trellis: no task";
+  }
+  const adoptedKey = adoptTrellisSessionKey(root, null);
+  const taskDir = adoptedKey ? readTaskDir(root, adoptedKey) : null;
   if (!taskDir) return "Trellis: no task";
 
   const fallback = basename(taskDir) || "task";
