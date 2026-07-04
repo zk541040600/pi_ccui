@@ -1,5 +1,4 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
 import { basename } from "node:path";
 
 export type FooterDataLike = {
@@ -66,6 +65,76 @@ const HIDDEN_STATUS_KEYS = new Set([
   "rewind",
   "trellis-status",
 ]);
+
+const ANSI_PATTERN = /^\x1b\[[0-9;?]*[ -/]*[@-~]/;
+
+function charWidth(value: string): number {
+  const cp = value.codePointAt(0) ?? 0;
+  if (cp === 0 || cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    cp === 0x2329 ||
+    cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+function visualWidth(text: string): number {
+  let width = 0;
+  for (let i = 0; i < text.length;) {
+    const ansi = text.slice(i).match(ANSI_PATTERN);
+    if (ansi) {
+      i += ansi[0].length;
+      continue;
+    }
+    const value = Array.from(text.slice(i))[0] ?? "";
+    width += charWidth(value);
+    i += value.length || 1;
+  }
+  return width;
+}
+
+function truncateToWidth(text: string, maxWidth: number): string {
+  if (maxWidth <= 0) return "";
+  if (visualWidth(text) <= maxWidth) return text;
+
+  const limit = Math.max(0, maxWidth - 1);
+  let width = 0;
+  let output = "";
+  for (let i = 0; i < text.length;) {
+    const ansi = text.slice(i).match(ANSI_PATTERN);
+    if (ansi) {
+      output += ansi[0];
+      i += ansi[0].length;
+      continue;
+    }
+    const value = Array.from(text.slice(i))[0] ?? "";
+    const nextWidth = width + charWidth(value);
+    if (nextWidth > limit) break;
+    output += value;
+    width = nextWidth;
+    i += value.length || 1;
+  }
+  return `${output}…\x1b[0m`;
+}
 
 type ModelStyle = {
   icon: string;

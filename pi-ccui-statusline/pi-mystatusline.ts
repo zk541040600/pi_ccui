@@ -7,6 +7,9 @@ import { renderStatusline, type UsageTotals, type WorkspaceStats } from "./statu
 
 type JsonObject = Record<string, unknown>;
 
+const STATUSLINE_REGISTRATION_KEY = Symbol.for("pi-ccui-statusline.registration");
+const STATUSLINE_INSTANCE_ID = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
 type SessionManagerWithIdentity = {
   getSessionId?: () => string;
   getSessionFile?: () => string | undefined;
@@ -193,6 +196,10 @@ function trellisTaskStatusText(ctx: ExtensionContext, event?: unknown): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  const globalState = globalThis as Record<symbol, unknown>;
+  if (typeof globalState[STATUSLINE_REGISTRATION_KEY] === "string") return;
+  globalState[STATUSLINE_REGISTRATION_KEY] = STATUSLINE_INSTANCE_ID;
+
   let workspace: WorkspaceStats = {
     dirty: false,
     added: 0,
@@ -415,6 +422,9 @@ export default function (pi: ExtensionAPI) {
     lastTps = null;
     requestFooterRender = undefined;
     clearFooterInstallTimers();
+    if (globalState[STATUSLINE_REGISTRATION_KEY] === STATUSLINE_INSTANCE_ID) {
+      delete globalState[STATUSLINE_REGISTRATION_KEY];
+    }
 
     if (ctx.hasUI) {
       ctx.ui.setFooter(undefined);
