@@ -45,6 +45,7 @@ const ICONS = {
 };
 
 const MODEL_HEX = "E3A869";
+const MODEL_PROVIDER_HEX = "B8A9FF";
 const PATH_HEX = "7CB7FF";
 const BRANCH_HEX = "91CB91";
 const CONTEXT_HEX = "B392F0";
@@ -256,10 +257,10 @@ function renderLine1(input: StatuslineRenderContext): string {
     .map(([, status]) => status);
   const statusText = statuses.length > 0 ? statuses.join(" ") : undefined;
   const thinkingLevel = getThinkingLevel();
-  const modelWithThinking = medium(
-    theme,
-    colorHex(theme, modelStyle.colorHex, `${modelStyle.label}(${thinkingLevel})`, modelStyle.fallback),
-  );
+  const providerLabel = typeof ctx.model?.provider === "string" && ctx.model.provider.trim() ? ctx.model.provider.trim() : undefined;
+  const providerPrefix = providerLabel ? colorHex(theme, MODEL_PROVIDER_HEX, `${providerLabel}/`, "dim") : "";
+  const modelCore = colorHex(theme, modelStyle.colorHex, `${modelStyle.label}(${thinkingLevel})`, modelStyle.fallback);
+  const modelWithThinking = medium(theme, `${providerPrefix}${modelCore}`);
 
   return joinParts(theme, [
     `${colorHex(theme, modelStyle.colorHex, medium(theme, modelStyle.icon), modelStyle.fallback)} ${modelWithThinking}`,

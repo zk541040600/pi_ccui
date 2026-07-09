@@ -4,7 +4,7 @@ A global Pi extension that replaces Pi's TUI footer with a compact Claude-Code-s
 
 ## What it shows
 
-- Current model and thinking level
+- Current provider, model, and thinking level
 - Current working directory basename
 - Git branch
 - Context usage percentage and token/window totals
