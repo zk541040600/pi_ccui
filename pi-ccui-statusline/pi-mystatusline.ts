@@ -1,19 +1,40 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { renderStatusline, type UsageTotals, type WorkspaceStats } from "./statusline.ts";
+import { installStatusline, type RegistrationLease } from "./extension-registration.ts";
+import { renderStatusline, type UsageTotals } from "./statusline.ts";
 
-type JsonObject = Record<string, unknown>;
-
-const STATUSLINE_REGISTRATION_KEY = Symbol.for("pi-ccui-statusline.registration");
-const STATUSLINE_INSTANCE_ID = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-
-type SessionManagerWithIdentity = {
-  getSessionId?: () => string;
-  getSessionFile?: () => string | undefined;
+type SessionManagerWithBranch = {
+  getBranch?: () => unknown;
 };
+
+type BranchEntryLike = {
+  type?: unknown;
+  message?: unknown;
+};
+
+const MAX_SESSION_BRANCH_ENTRIES = 50_000;
+const MAX_AGENT_MESSAGES = 10_000;
+
+/** Snapshot an untrusted Array without invoking its iterator or unbounded length. */
+function safeArraySnapshot<T>(value: unknown, maxEntries: number): T[] {
+  try {
+    if (!Array.isArray(value)) return [];
+    const length = value.length;
+    if (!Number.isSafeInteger(length) || length < 0 || length > maxEntries) return [];
+
+    const snapshot: T[] = [];
+    for (let index = 0; index < length; index += 1) {
+      try {
+        snapshot.push(value[index] as T);
+      } catch {
+        // Ignore a malformed element getter while keeping the remaining entries.
+      }
+    }
+    return snapshot;
+  } catch {
+    return [];
+  }
+}
 
 function isAssistantMessage(message: unknown): message is AssistantMessage {
   if (!message || typeof message !== "object") return false;
@@ -21,413 +42,233 @@ function isAssistantMessage(message: unknown): message is AssistantMessage {
   return role === "assistant";
 }
 
-function str(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function callStr(fn: (() => unknown) | undefined): string | null {
+function isStaleExtensionContextError(error: unknown): boolean {
   try {
-    return typeof fn === "function" ? str(fn()) : null;
-  } catch {
-    return null;
-  }
-}
-
-function hash(value: string): string {
-  return createHash("sha256").update(value).digest("hex").slice(0, 32);
-}
-
-function readText(path: string): string {
-  try {
-    return readFileSync(path, "utf8");
-  } catch {
-    return "";
-  }
-}
-
-function findTrellisRoot(cwd: string): string | null {
-  let current = resolve(cwd);
-  while (true) {
-    if (existsSync(join(current, ".trellis"))) return current;
-    const parent = dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-
-function sanitizeKey(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 160) || hash(value);
-}
-
-function contextKey(event: unknown, ctx: ExtensionContext): string | null {
-  const envKey = str(process.env.TRELLIS_CONTEXT_ID);
-  if (envKey) return sanitizeKey(envKey);
-
-  const sessionManager = ctx.sessionManager as SessionManagerWithIdentity;
-  const sessionId =
-    callStr(() => sessionManager.getSessionId?.()) ??
-    str(process.env.PI_SESSION_ID) ??
-    str(process.env.PI_SESSIONID);
-  if (sessionId) return `pi_${sanitizeKey(sessionId)}`;
-
-  const eventObject = event && typeof event === "object" ? (event as JsonObject) : null;
-  const eventSession = str(eventObject?.session_id) ?? str(eventObject?.sessionId) ?? str(eventObject?.sessionID);
-  if (eventSession) return `pi_${sanitizeKey(eventSession)}`;
-
-  const transcript =
-    callStr(() => sessionManager.getSessionFile?.()) ??
-    str(eventObject?.transcript_path) ??
-    str(eventObject?.transcriptPath) ??
-    str(eventObject?.transcript);
-  return transcript ? `pi_transcript_${hash(transcript)}` : null;
-}
-
-function sessionFile(root: string, key: string): string {
-  return join(root, ".trellis", ".runtime", "sessions", `${key}.json`);
-}
-
-function sessionHasTask(root: string, key: string): boolean {
-  try {
-    const data = JSON.parse(readText(sessionFile(root, key))) as JsonObject;
-    return !!str(data.current_task);
+    if (!(error instanceof Error)) return false;
+    const message = error.message;
+    return typeof message === "string"
+      && /(?:Extension context no longer active|This extension ctx is stale|ctx is stale|context.*stale)/i.test(message);
   } catch {
     return false;
   }
 }
 
-function countOtherSessionsWithTask(root: string, currentKey: string | null): number {
+function warnUiFailure(label: string, error: unknown): void {
+  if (isStaleExtensionContextError(error)) return;
+  let category = "unknown error";
   try {
-    const dir = join(root, ".trellis", ".runtime", "sessions");
-    return readdirSync(dir)
-      .filter((file) => file.endsWith(".json"))
-      .map((file) => file.slice(0, -5))
-      .filter((candidate) => candidate !== currentKey && sessionHasTask(root, candidate))
-      .length;
+    const name = error instanceof Error ? error.name : undefined;
+    if (typeof name === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(name)) category = name;
   } catch {
-    return 0;
+    // Keep the redacted fallback when error metadata is itself hostile.
+  }
+  try {
+    console.warn(`pi-ccui-statusline UI ${label} failed (${category})`);
+  } catch {
+    // Diagnostics must never escape into the Pi lifecycle.
   }
 }
 
-function adoptTrellisSessionKey(root: string, key: string | null): string | null {
-  if (key && sessionHasTask(root, key)) return key;
-
+function safeRequestRender(tui: { requestRender?: () => void }, label = "requestRender"): void {
   try {
-    const dir = join(root, ".trellis", ".runtime", "sessions");
-    const keys = readdirSync(dir)
-      .filter((file) => file.endsWith(".json"))
-      .map((file) => file.slice(0, -5))
-      .filter((candidate) => sessionHasTask(root, candidate));
-    const processKeys = keys.filter((candidate) => candidate.startsWith("pi_process_"));
-    const candidates = processKeys.length > 0 ? processKeys : keys;
-    return candidates.length === 1 ? candidates[0]! : key;
-  } catch {
-    return key;
+    tui.requestRender?.();
+  } catch (error) {
+    warnUiFailure(label, error);
   }
 }
 
-function readTaskDir(root: string, key: string | null): string | null {
-  if (!key) return null;
-
+function safeHasUI(ctx: ExtensionContext): boolean {
   try {
-    const data = JSON.parse(readText(sessionFile(root, key))) as JsonObject;
-    let ref = str(data.current_task);
-    if (!ref) return null;
-
-    ref = ref.replace(/\\/g, "/").replace(/^\.\//, "");
-    if (ref.startsWith("tasks/")) ref = `.trellis/${ref}`;
-    if (ref.startsWith(".trellis/")) return join(root, ref);
-    if (isAbsolute(ref)) return ref;
-    return join(root, ".trellis", "tasks", ref);
-  } catch {
-    return null;
+    return ctx.hasUI === true && (ctx as { mode?: string }).mode === "tui";
+  } catch (error) {
+    warnUiFailure("hasUI", error);
+    return false;
   }
 }
 
-function trellisTaskStatusText(ctx: ExtensionContext, event?: unknown): string {
-  const root = findTrellisRoot(ctx.cwd);
-  if (!root) return "Trellis: no project";
-
-  const currentKey = contextKey(event, ctx);
-
-  if (currentKey) {
-    // We have an identified session — show its task or diagnostic
-    if (sessionHasTask(root, currentKey)) {
-      const taskDir = readTaskDir(root, currentKey);
-      if (taskDir) {
-        const fallback = basename(taskDir) || "task";
-        try {
-          const data = JSON.parse(readText(join(taskDir, "task.json"))) as JsonObject;
-          const id = str(data.id) ?? fallback;
-          const status = str(data.status);
-          const text = `Trellis: ${id}${status ? ` (${status})` : ""}`;
-          return text.length > 80 ? `${text.slice(0, 79)}…` : text;
-        } catch {
-          return `Trellis: ${fallback}`;
-        }
-      }
-    }
-    // Current key exists but has no task — diagnostic, do not adopt another session
-    const otherCount = countOtherSessionsWithTask(root, currentKey);
-    if (otherCount > 0) {
-      return `Trellis: no task (${otherCount} other session${otherCount > 1 ? "s" : ""})`;
-    }
-    return "Trellis: no task";
-  }
-
-  // No current key — use single-session fallback only when exactly one task session exists.
-  const otherCount = countOtherSessionsWithTask(root, null);
-  if (otherCount !== 1) {
-    return otherCount > 0 ? `Trellis: no task (${otherCount} other sessions)` : "Trellis: no task";
-  }
-  const adoptedKey = adoptTrellisSessionKey(root, null);
-  const taskDir = adoptedKey ? readTaskDir(root, adoptedKey) : null;
-  if (!taskDir) return "Trellis: no task";
-
-  const fallback = basename(taskDir) || "task";
+function safeSetFooter(ctx: ExtensionContext, footer: Parameters<ExtensionContext["ui"]["setFooter"]>[0]): void {
   try {
-    const data = JSON.parse(readText(join(taskDir, "task.json"))) as JsonObject;
-    const id = str(data.id) ?? fallback;
-    const status = str(data.status);
-    const text = `Trellis: ${id}${status ? ` (${status})` : ""}`;
-    return text.length > 80 ? `${text.slice(0, 79)}…` : text;
-  } catch {
-    return `Trellis: ${fallback}`;
+    if (!safeHasUI(ctx)) return;
+    ctx.ui.setFooter(footer);
+  } catch (error) {
+    warnUiFailure("setFooter", error);
   }
 }
 
-export default function (pi: ExtensionAPI) {
-  const globalState = globalThis as Record<symbol, unknown>;
-  if (typeof globalState[STATUSLINE_REGISTRATION_KEY] === "string") return;
-  globalState[STATUSLINE_REGISTRATION_KEY] = STATUSLINE_INSTANCE_ID;
+function safeUnsubscribe(unsubscribe: (() => void) | undefined, label: string): void {
+  try {
+    unsubscribe?.();
+  } catch (error) {
+    warnUiFailure(label, error);
+  }
+}
 
-  let workspace: WorkspaceStats = {
-    dirty: false,
-    added: 0,
-    removed: 0,
+function readSessionBranch(ctx: ExtensionContext): BranchEntryLike[] {
+  try {
+    const branch = (ctx.sessionManager as SessionManagerWithBranch | undefined)?.getBranch?.();
+    return safeArraySnapshot<BranchEntryLike>(branch, MAX_SESSION_BRANCH_ENTRIES);
+  } catch {
+    return [];
+  }
+}
+
+function eventMessages(event: unknown): unknown[] {
+  try {
+    if (!event || typeof event !== "object") return [];
+    const messages = (event as { messages?: unknown }).messages;
+    return safeArraySnapshot(messages, MAX_AGENT_MESSAGES);
+  } catch {
+    return [];
+  }
+}
+
+function buildRegistrationSteps(
+  pi: ExtensionAPI,
+  lease: RegistrationLease,
+): Array<() => unknown> {
+  type RuntimeState = {
+    usageTotals: UsageTotals;
+    agentStartMs: number | null;
+    lastTps: number | null;
+    requestFooterRender: (() => void) | undefined;
   };
-  let usageTotals: UsageTotals = {
-    input: 0,
-    output: 0,
-    cost: 0,
+
+  const state: RuntimeState = {
+    usageTotals: { input: 0, output: 0, cost: 0 },
+    agentStartMs: null,
+    lastTps: null,
+    requestFooterRender: undefined,
   };
-  let trellisTaskStatus = "Trellis: no task";
-  let agentStartMs: number | null = null;
-  let lastTps: number | null = null;
-  let requestFooterRender: (() => void) | undefined;
-  const footerInstallTimers = new Set<NodeJS.Timeout>();
 
   const refreshUsageTotals = (ctx: ExtensionContext) => {
     let input = 0;
     let output = 0;
     let cost = 0;
 
-    for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-      const usage = (entry.message as Partial<AssistantMessage>).usage;
-      if (!usage) continue;
+    for (const entry of readSessionBranch(ctx)) {
+      try {
+        if (entry.type !== "message" || !entry.message || typeof entry.message !== "object") continue;
+        const message = entry.message as Partial<AssistantMessage> & { role?: unknown };
+        if (message.role !== "assistant") continue;
+        const usage = message.usage;
+        if (!usage) continue;
 
-      input += usage.input ?? 0;
-      output += usage.output ?? 0;
-      cost += usage.cost?.total ?? 0;
+        if (typeof usage.input === "number" && Number.isFinite(usage.input)) input += Math.max(0, usage.input);
+        if (typeof usage.output === "number" && Number.isFinite(usage.output)) output += Math.max(0, usage.output);
+        if (typeof usage.cost?.total === "number" && Number.isFinite(usage.cost.total)) cost += Math.max(0, usage.cost.total);
+      } catch {
+        // Ignore malformed historical entries while preserving the remaining totals.
+      }
     }
 
-    usageTotals = { input, output, cost };
-  };
-
-  const refreshTrellisTask = (ctx: ExtensionContext, event?: unknown) => {
-    trellisTaskStatus = trellisTaskStatusText(ctx, event);
-  };
-
-  const refreshWorkspace = async (ctx: ExtensionContext) => {
-    const git = (args: string[]) =>
-      pi.exec("git", ["-c", "i18n.logOutputEncoding=UTF-8", "-C", ctx.cwd, ...args], {
-        signal: ctx.signal,
-        timeout: 5000,
-      });
-
-    try {
-      const rootCheck = await git(["rev-parse", "--is-inside-work-tree"]);
-      if (rootCheck.code !== 0 || rootCheck.stdout.trim() !== "true") {
-        workspace = { dirty: false, added: 0, removed: 0 };
-        return;
-      }
-
-      const status = await git(["status", "--porcelain"]);
-      if (status.code !== 0) return;
-
-      const unstaged = await git(["diff", "--numstat"]);
-      if (unstaged.code !== 0) return;
-
-      const staged = await git(["diff", "--cached", "--numstat"]);
-      if (staged.code !== 0) return;
-
-      let added = 0;
-      let removed = 0;
-      for (const line of `${unstaged.stdout}\n${staged.stdout}`.split("\n")) {
-        const [add, del] = line.split("\t");
-        if (add && add !== "-") added += Number(add) || 0;
-        if (del && del !== "-") removed += Number(del) || 0;
-      }
-
-      workspace = {
-        dirty: status.stdout.trim().length > 0,
-        added,
-        removed,
-      };
-    } catch {
-      // Git, timeout, or abort failures should never break the Pi UI.
-    }
+    state.usageTotals = { input, output, cost };
   };
 
   const installFooter = (ctx: ExtensionContext) => {
-    if (!ctx.hasUI) return;
+    if (!safeHasUI(ctx)) return;
 
-    ctx.ui.setFooter((tui, theme, footerData) => {
-      const requestRender = () => tui.requestRender();
-      requestFooterRender = requestRender;
-      const unsubscribeBranch = footerData.onBranchChange(requestRender);
+    safeSetFooter(ctx, (tui, theme, footerData) => {
+      const requestRender = () => safeRequestRender(tui, "footer requestRender");
+      state.requestFooterRender = requestRender;
+      let unsubscribeBranch: (() => void) | undefined;
+      try {
+        unsubscribeBranch = footerData.onBranchChange(requestRender);
+      } catch (error) {
+        warnUiFailure("onBranchChange", error);
+      }
 
       return {
         dispose() {
-          if (requestFooterRender === requestRender) requestFooterRender = undefined;
-          unsubscribeBranch();
+          if (state.requestFooterRender === requestRender) state.requestFooterRender = undefined;
+          safeUnsubscribe(unsubscribeBranch, "branch unsubscribe");
         },
         invalidate() {},
         render(width: number): string[] {
-          return renderStatusline(width, {
-            ctx,
-            theme,
-            footerData,
-            getThinkingLevel: () => pi.getThinkingLevel(),
-            workspace,
-            usageTotals,
-            lastTps,
-            trellisTaskStatus,
-          });
+          try {
+            return renderStatusline(width, {
+              ctx,
+              theme,
+              footerData,
+              getThinkingLevel: () => pi.getThinkingLevel(),
+              usageTotals: state.usageTotals,
+              lastTps: state.lastTps,
+            });
+          } catch (error) {
+            warnUiFailure("footer render", error);
+            return [];
+          }
         },
       };
     });
   };
 
-  const scheduleFooterInstall = (ctx: ExtensionContext) => {
-    if (!ctx.hasUI) return;
-
-    installFooter(ctx);
-
-    // A global compact-footer extension also calls setFooter() on startup and
-    // schedules delayed re-installs. Re-apply ccui shortly after those hooks so
-    // the project package remains the active footer without mutating global config.
-    for (const delayMs of [0, 150, 500]) {
-      const timer = setTimeout(() => {
-        footerInstallTimers.delete(timer);
-        installFooter(ctx);
-      }, delayMs);
-      footerInstallTimers.add(timer);
-    }
+  const cleanupRuntimeState = () => {
+    state.usageTotals = { input: 0, output: 0, cost: 0 };
+    state.agentStartMs = null;
+    state.lastTps = null;
+    state.requestFooterRender = undefined;
   };
 
-  const clearFooterInstallTimers = () => {
-    for (const timer of footerInstallTimers) clearTimeout(timer);
-    footerInstallTimers.clear();
-  };
+  return [
+    () => pi.on("session_start", lease.guard((_event, ctx) => {
+      if (!safeHasUI(ctx)) return;
+      refreshUsageTotals(ctx);
+      installFooter(ctx);
+    })),
+    () => pi.on("resources_discover", lease.guard((_event, ctx) => {
+      installFooter(ctx);
+    })),
+    () => pi.on("context", lease.guard(() => {
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("tool_call", lease.guard(() => {
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("tool_result", lease.guard(() => {
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("turn_end", lease.guard((_event, ctx) => {
+      if (!safeHasUI(ctx)) return;
+      refreshUsageTotals(ctx);
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("before_agent_start", lease.guard(() => {
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("agent_start", lease.guard(() => {
+      if (!state.requestFooterRender) return;
+      state.agentStartMs = Date.now();
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("agent_end", lease.guard((event) => {
+      if (state.agentStartMs === null) return;
 
-  pi.on("session_start", async (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    refreshUsageTotals(ctx);
-    await refreshWorkspace(ctx);
-    scheduleFooterInstall(ctx);
-  });
+      const elapsedMs = Date.now() - state.agentStartMs;
+      state.agentStartMs = null;
+      if (elapsedMs <= 0) return;
 
-  pi.on("resources_discover", async (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    scheduleFooterInstall(ctx);
-  });
+      let output = 0;
+      for (const message of eventMessages(event)) {
+        try {
+          if (!isAssistantMessage(message)) continue;
+          const value = message.usage?.output;
+          if (typeof value === "number" && Number.isFinite(value) && value > 0) output += value;
+        } catch {
+          // Ignore malformed message getters without breaking the Pi lifecycle.
+        }
+      }
+      if (output <= 0) return;
 
-  pi.on("context", (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    requestFooterRender?.();
-  });
+      state.lastTps = output / (elapsedMs / 1000);
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("model_select", lease.guard(() => {
+      state.requestFooterRender?.();
+    })),
+    () => pi.on("session_shutdown", lease.guard(() => cleanupRuntimeState())),
+  ];
+}
 
-  pi.on("tool_call", (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    requestFooterRender?.();
-  });
-
-  pi.on("tool_result", (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    requestFooterRender?.();
-  });
-
-  pi.on("turn_end", async (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    refreshUsageTotals(ctx);
-    await refreshWorkspace(ctx);
-    scheduleFooterInstall(ctx);
-    requestFooterRender?.();
-  });
-
-  pi.on("before_agent_start", async (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    // Pi resets extension UI while rebinding the session for a new prompt. Reinstall
-    // here so the built-in footer does not flash back after the user submits input.
-    scheduleFooterInstall(ctx);
-  });
-
-  pi.on("agent_start", (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    agentStartMs = Date.now();
-    scheduleFooterInstall(ctx);
-  });
-
-  pi.on("agent_end", (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    if (agentStartMs === null) return;
-
-    const elapsedMs = Date.now() - agentStartMs;
-    agentStartMs = null;
-    if (elapsedMs <= 0) return;
-
-    let output = 0;
-    for (const message of event.messages) {
-      if (!isAssistantMessage(message)) continue;
-      output += message.usage?.output ?? 0;
-    }
-
-    if (output <= 0) return;
-
-    lastTps = output / (elapsedMs / 1000);
-    scheduleFooterInstall(ctx);
-    requestFooterRender?.();
-  });
-
-  pi.on("model_select", async (event, ctx) => {
-    refreshTrellisTask(ctx, event);
-    scheduleFooterInstall(ctx);
-    requestFooterRender?.();
-  });
-
-  pi.on("session_shutdown", async (_event, ctx) => {
-    workspace = {
-      dirty: false,
-      added: 0,
-      removed: 0,
-    };
-    usageTotals = {
-      input: 0,
-      output: 0,
-      cost: 0,
-    };
-    trellisTaskStatus = "Trellis: no task";
-    agentStartMs = null;
-    lastTps = null;
-    requestFooterRender = undefined;
-    clearFooterInstallTimers();
-    if (globalState[STATUSLINE_REGISTRATION_KEY] === STATUSLINE_INSTANCE_ID) {
-      delete globalState[STATUSLINE_REGISTRATION_KEY];
-    }
-
-    if (ctx.hasUI) {
-      ctx.ui.setFooter(undefined);
-    }
-  });
+export default function registerStatusline(pi: ExtensionAPI): void {
+  installStatusline(pi, (lease) => buildRegistrationSteps(pi, lease));
 }

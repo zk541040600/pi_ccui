@@ -2,6 +2,7 @@
   "name": "pi-ccui-statusline",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.9.0",
   "description": "Custom Pi TUI statusline/footer extension.",
   "type": "module",
   "keywords": [
@@ -10,7 +11,8 @@
     "statusline"
   ],
   "scripts": {
-    "check": "tsc --noEmit"
+    "test": "node --experimental-transform-types smoke-test.mjs",
+    "check": "tsc --noEmit && npm test"
   },
   "pi": {
     "extensions": [
@@ -23,10 +25,10 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.80.2",
-    "@earendil-works/pi-coding-agent": "0.80.2",
-    "@earendil-works/pi-tui": "0.80.2",
-    "@types/node": "24.12.4",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/node": "22.20.1",
     "typescript": "5.9.3"
   },
   "engines": {
