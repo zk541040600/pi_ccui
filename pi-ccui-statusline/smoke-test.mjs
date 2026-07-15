@@ -289,9 +289,6 @@ function testHidesCacheHeartbeatStatus() {
         return new Map([
           ["cache-heartbeat", "cache:observe unknown provider/model"],
           ["gpt-us-ip-check", "GPT IP: US"],
-          ["trellis-\u200bstatus", "SPOOFED-TASK"],
-          ["\x1b[31mtrellis-status\x1b[0m", "ANSI-SPOOFED-TASK"],
-          ["trellis-status", "Trellis: owner-task (in_progress)"],
           ["checkpoint-lookalike", "◆\u200b 7 checkpoints"],
           ["other-extension", "visible-status"],
         ]);
@@ -318,11 +315,54 @@ function testHidesCacheHeartbeatStatus() {
   assert.equal(lines.length, 1);
   assert(!lines[0].includes("cache:observe"), "cache heartbeat status should stay hidden");
   assert(!lines[0].includes("GPT IP:"), "GPT IP check status should stay hidden");
-  assert(!lines[0].includes("SPOOFED-TASK"), "lookalike keys must not claim the authoritative Trellis segment");
-  assert(!lines[0].includes("ANSI-SPOOFED-TASK"), "sanitized lookalike keys must not become authoritative");
   assert(!lines[0].includes("checkpoints"), "checkpoint noise filtering must use canonical text");
-  assert.equal(lines[0].split("Trellis: owner-task").length - 1, 1, "Trellis provider status must render once in its dedicated segment");
   assert(lines[0].includes("visible-status"), "other non-noisy statuses should still render");
+}
+
+function testDedicatedGptFastStatus() {
+  const active = renderStatusline(320, renderFixture({
+    statuses: new Map([
+      ["gpt-fast", "FAST"],
+      ["other-extension", "visible-status"],
+    ]),
+  }))[0];
+  const activeText = active.replace(/\x1b\[[0-9;]*m/g, "");
+  const modelIndex = activeText.indexOf("provider/model(off)");
+  const fastIndex = activeText.indexOf("FAST");
+  const cwdIndex = activeText.indexOf("example");
+  assert(activeText.includes(" FAST"), "FAST must include its dedicated lightning icon");
+  assert(modelIndex >= 0 && modelIndex < fastIndex, "FAST must render after model/thinking");
+  assert(fastIndex < cwdIndex, "FAST must render before cwd");
+  assert.equal(activeText.split("FAST").length - 1, 1, "FAST must render exactly once");
+  assert(activeText.indexOf("visible-status") > cwdIndex, "generic statuses must remain in their existing trailing segment");
+  for (const width of [1, 24, 80]) {
+    assert.equal(
+      visibleWidth(renderStatusline(width, renderFixture({ statuses: new Map([["gpt-fast", "FAST"]]) }))[0]),
+      width,
+      `dedicated FAST segment must preserve the existing ${width}-column truncation contract`,
+    );
+  }
+
+  const paused = renderStatusline(320, renderFixture({ statuses: new Map([["gpt-fast", "FAST paused"]]) }))[0];
+  const pausedText = paused.replace(/\x1b\[[0-9;]*m/g, "");
+  assert(pausedText.includes(" FAST paused"), "paused FAST must keep the lightning icon");
+  assert(pausedText.indexOf("provider/model(off)") < pausedText.indexOf("FAST paused"));
+  assert(pausedText.indexOf("FAST paused") < pausedText.indexOf("example"));
+  assert.equal(pausedText.split("FAST paused").length - 1, 1, "paused state must render exactly once");
+
+  const lookalike = renderStatusline(320, renderFixture({
+    statuses: new Map([
+      ["gpt-\u200bfast", "lookalike-visible"],
+      ["\x1b[31mgpt-fast\x1b[0m", "ansi-lookalike-visible"],
+    ]),
+  }))[0];
+  assert(lookalike.indexOf("lookalike-visible") > lookalike.indexOf("example"), "lookalike key must stay generic");
+  assert(lookalike.indexOf("ansi-lookalike-visible") > lookalike.indexOf("example"), "ANSI key must stay generic");
+
+  const invalidExactValue = renderStatusline(320, renderFixture({
+    statuses: new Map([["gpt-fast", "FAST\x1b[31m"]]),
+  }))[0];
+  assert(!invalidExactValue.includes("FAST"), "dedicated value must match the raw protocol exactly");
 }
 
 function testRobustStatuslineRender() {
@@ -557,7 +597,6 @@ function testSanitizesDynamicTerminalText() {
           ["c1-csi", "\u009b?25lMCP: c1-secret"],
           ["zero-width-status", "M\u200bCP: zero-width-secret"],
           ["cache-\u200bheartbeat", "zero-width-key-secret"],
-          ["trellis-status", "Trellis: task\nname\x1b[2J"],
           ["visible", "\x1b]0;status-title\x07visible\rstatus\u2066"],
         ]);
       },
@@ -571,7 +610,6 @@ function testSanitizesDynamicTerminalText() {
   assert.doesNotMatch(withoutSgr, /[\u0000-\u001f\u007f-\u009f]|\p{Bidi_Control}/u);
   assert(!line.includes("secret"), "canonicalized MCP status must remain hidden");
   assert(!line.includes("PAYLOAD"), "terminal control-string payloads must be removed with their wrappers");
-  assert(line.includes("Trellis: task name"), "dedicated Trellis provider text must use terminal canonicalization");
   assert(line.includes("visible status"), "safe visible status text should remain readable");
 }
 
@@ -660,6 +698,7 @@ await testRegistrationLifecycle();
 await testNonTuiSessionsSkipStatuslineWork();
 await testIdentityFailureDoesNotForkRuntimeState();
 testHidesCacheHeartbeatStatus();
+testDedicatedGptFastStatus();
 testRobustStatuslineRender();
 testSanitizesDynamicTerminalText();
 testRobustStatusSnapshots();

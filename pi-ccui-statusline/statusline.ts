@@ -32,6 +32,7 @@ export type StatuslineRenderContext = {
 const ICONS = {
   context: "",
   branch: "",
+  fast: "",
   folder: "󰉋",
   warn: "",
   tps: "󰓅",
@@ -44,7 +45,7 @@ const BRANCH_HEX = "91CB91";
 const CONTEXT_HEX = "B392F0";
 const COST_HEX = "FF78A2";
 const TPS_HEX = "6ED7D3";
-const TRELLIS_HEX = "D7BA7D";
+const GPT_FAST_HEX = "39FF14";
 const SEPARATOR_HEX = "3B4048";
 const MAX_RENDER_WIDTH = 4096;
 const MAX_STATUS_SNAPSHOT_COUNT = 64;
@@ -66,7 +67,6 @@ const HIDDEN_STATUS_KEYS = new Set([
   "mcp",
   "pi-ocr",
   "rewind",
-  "trellis-status",
 ]);
 
 type ModelStyle = {
@@ -79,7 +79,8 @@ type ModelStyle = {
 type StatusEntrySnapshot = {
   key: string;
   status: string;
-  isTrellisProvider: boolean;
+  isGptFastProvider: boolean;
+  gptFastStatus?: "FAST" | "FAST paused";
 };
 
 function formatCompactTokens(value: number): string {
@@ -199,9 +200,16 @@ function safeStatusEntries(footerData: FooterDataLike): StatusEntrySnapshot[] {
         const entry = next.value;
         if (!Array.isArray(entry) || entry.length < 2) continue;
         const rawKey = entry[0];
+        const rawStatus = entry[1];
         const key = terminalText(rawKey, MAX_LABEL_LENGTH);
-        const status = terminalText(entry[1], MAX_STATUS_LENGTH);
-        if (key && status) entries.push({ key, status, isTrellisProvider: rawKey === "trellis-status" });
+        const status = terminalText(rawStatus, MAX_STATUS_LENGTH);
+        if (key && status) {
+          const isGptFastProvider = rawKey === "gpt-fast";
+          const gptFastStatus = isGptFastProvider && (rawStatus === "FAST" || rawStatus === "FAST paused")
+            ? rawStatus
+            : undefined;
+          entries.push({ key, status, isGptFastProvider, gptFastStatus });
+        }
       }
     } finally {
       if (!exhausted && typeof iterator.return === "function") iterator.return();
@@ -232,9 +240,8 @@ function joinParts(theme: StatuslineThemeLike, parts: Array<string | undefined>)
   return parts.filter((part): part is string => Boolean(part)).join(colorHex(theme, SEPARATOR_HEX, " | ", "dim"));
 }
 
-function renderTrellisTask(theme: StatuslineThemeLike, text: string): string {
-  const fallback = text === "Trellis: no task" || text === "Trellis: no project" ? "dim" : "warning";
-  return colorHex(theme, TRELLIS_HEX, medium(theme, text), fallback);
+function renderGptFast(theme: StatuslineThemeLike, text: "FAST" | "FAST paused"): string {
+  return colorHex(theme, GPT_FAST_HEX, medium(theme, `${ICONS.fast} ${text}`), text === "FAST" ? "success" : "warning");
 }
 
 function renderLine1(input: StatuslineRenderContext): string {
@@ -272,11 +279,10 @@ function renderLine1(input: StatuslineRenderContext): string {
       )}`
     : undefined;
   const statusEntries = safeStatusEntries(footerData);
-  const trellisTaskStatus = statusEntries.find(
-    ({ isTrellisProvider }) => isTrellisProvider,
-  )?.status;
+  const gptFastStatus = statusEntries.find(({ isGptFastProvider }) => isGptFastProvider)?.gptFastStatus;
   const statuses = statusEntries
-    .filter(({ key, status }) => {
+    .filter(({ key, status, isGptFastProvider }) => {
+      if (isGptFastProvider) return false;
       const lowerKey = canonicalFilterText(key);
       const lowerStatus = canonicalFilterText(status);
       if (HIDDEN_STATUS_KEYS.has(lowerKey) || lowerKey.startsWith("codex-compact")) return false;
@@ -286,7 +292,6 @@ function renderLine1(input: StatuslineRenderContext): string {
       if (lowerStatus.startsWith("cache:")) return false;
       if (lowerStatus.startsWith("gpt ip:")) return false;
       if (lowerStatus.startsWith("ocr:")) return false;
-      if (lowerStatus.startsWith("trellis:")) return false;
       if (/^[◆◇]\s+\d+ checkpoints$/u.test(lowerStatus)) return false;
       return true;
     })
@@ -315,12 +320,12 @@ function renderLine1(input: StatuslineRenderContext): string {
 
   return joinParts(theme, [
     modelLabel,
+    gptFastStatus ? renderGptFast(theme, gptFastStatus) : undefined,
     cwdLabel,
     branchLabel,
     contextLabel,
     costLabel,
     colorHex(theme, TPS_HEX, medium(theme, tpsText), "accent"),
-    trellisTaskStatus ? renderTrellisTask(theme, trellisTaskStatus) : undefined,
     statusText,
   ]);
 }
